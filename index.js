@@ -36,10 +36,11 @@ const hash = value => crypto.createHash('sha256').update(String(value)).digest()
 const sameSecret = (a, b) => crypto.timingSafeEqual(hash(a), hash(b));
 
 // JSON data is interpolated as Lua literals, never evaluated as code from the browser.
-function gameClient(baseURL, deviceToken) {
+function gameClient(baseURL, adminKey) {
   return `-- NEVER web client. Controls live on the website; no in-game panel.
 local WEB_URL = ${JSON.stringify(baseURL)}
-local DEVICE_TOKEN = ${JSON.stringify(deviceToken)}
+-- KEY must match Railway ADMIN_KEY and the web sign-in password exactly.
+local KEY = ${JSON.stringify(adminKey)}
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local player = Players.LocalPlayer
@@ -179,8 +180,12 @@ end
 
 local function sync()
     local response = requestFn({Url = WEB_URL .. "/api/device/sync", Method = "POST",
-        Headers = {["Content-Type"] = "application/json", Authorization = "Bearer " .. DEVICE_TOKEN},
+        Headers = {["Content-Type"] = "application/json", Authorization = "Bearer " .. KEY},
         Body = HttpService:JSONEncode({deviceId = deviceId, player = player.Name, status = status})})
+    if response and (response.StatusCode == 401 or response.StatusCode == 403) then
+        runtime.keyRejected = true
+        error("KEY does not match Railway ADMIN_KEY", 0)
+    end
     assert(response and response.StatusCode == 200, "Web connection failed")
     local body = HttpService:JSONDecode(response.Body)
     local nextConfig = body.config
@@ -267,6 +272,13 @@ table.insert(runtime.workers, task.spawn(function()
         local ok = pcall(sync)
         if ok then failures = 0 else
             failures = failures + 1
+            if runtime.keyRejected then
+                runtime.connected = false
+                barrier.Visible = false
+                warn("Never: KEY ไม่ตรงกับ ADMIN_KEY ของเว็บ กรุณาแก้แล้วรันใหม่")
+                task.defer(runtime.stop)
+                break
+            end
             status.message = "เชื่อมเว็บไม่สำเร็จ"
             if os.clock() - lastSync > 10 then runtime.connected = false; barrier.Visible = false end
         end
@@ -373,7 +385,6 @@ function createApp({adminKey, dataDir, publicURL, secureCookies = false} = {}) {
     revision = Number.isSafeInteger(saved.revision) ? saved.revision : 0;
   }
   const sessions = new Map(), devices = new Map(), attempts = new Map();
-  const deviceToken = crypto.createHmac('sha256', adminKey).update('never-device-read-v1').digest('hex');
   const sessionTTL = 86400000;
   const snapshot = () => ({config, revision, devices:[...devices.values()].map(device => ({...device,online:Date.now()-device.lastSeen<10000}))});
   function send(res, code, body, headers = {}) {
@@ -424,7 +435,7 @@ function createApp({adminKey, dataDir, publicURL, secureCookies = false} = {}) {
         return send(res,200,{ok:true},{'Set-Cookie':'never_session='+session+'; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400'+(secureCookies?'; Secure':'')});
       }
       if (pathname==='/api/device/sync' && req.method==='POST') {
-        if (!sameSecret(req.headers.authorization || '', 'Bearer '+deviceToken)) return send(res,401,{error:'Unauthorized'});
+        if (!sameSecret(req.headers.authorization || '', 'Bearer '+adminKey)) return send(res,401,{error:'Unauthorized'});
         const body = await readBody(req);
         if (typeof body.deviceId!=='string' || !/^[a-zA-Z0-9-]{1,64}$/.test(body.deviceId)) return send(res,400,{error:'Invalid device'});
         if (!devices.has(body.deviceId) && devices.size>=100) return send(res,429,{error:'Too many devices'});
@@ -446,7 +457,7 @@ function createApp({adminKey, dataDir, publicURL, secureCookies = false} = {}) {
         config=updated;revision=nextRevision;
         return send(res,200,snapshot());
       }
-      if (pathname==='/api/script' && req.method==='GET') return send(res,200,gameClient(originOf(req),deviceToken),{'Content-Type':'text/plain; charset=utf-8','Content-Disposition':'attachment; filename="Never-web.lua"'});
+      if (pathname==='/api/script' && req.method==='GET') return send(res,200,gameClient(originOf(req),adminKey),{'Content-Type':'text/plain; charset=utf-8','Content-Disposition':'attachment; filename="Never-web.lua"'});
       if (pathname==='/api/logout' && req.method==='POST') {
         const cookie = /(?:^|;\s*)never_session=([a-f0-9]+)/.exec(req.headers.cookie || '');if(cookie)sessions.delete(cookie[1]);
         return send(res,200,{ok:true},{'Set-Cookie':'never_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'+(secureCookies?'; Secure':'')});
@@ -473,6 +484,7 @@ async function test() {
     assert.equal((await fetch(base+'/health')).status,200);
     assert.equal((await fetch(base+'/api/state')).status,401);
     assert.equal((await fetch(base+'/api/device/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).status,401);
+    assert.equal((await fetch(base+'/api/device/sync',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer incorrect-key'},body:'{"deviceId":"test-device"}'})).status,401);
     const login=await fetch(base+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});
     assert.equal(login.status,200);const cookie=login.headers.get('set-cookie').split(';')[0];
     const headers={'Content-Type':'application/json',Cookie:cookie};
@@ -483,8 +495,8 @@ async function test() {
     assert.equal((await fetch(base+'/api/config',{method:'PATCH',headers:{...headers,Origin:'https://elsewhere.example'},body:'{"radius":0}'})).status,403);
     const script=await(await fetch(base+'/api/script',{headers:{Cookie:cookie}})).text();
     assert.ok(script.includes('Event:FireServer(target, "Head")'));assert.ok(script.includes(base));
-    const token=crypto.createHmac('sha256',key).update('never-device-read-v1').digest('hex');
-    const synced=await fetch(base+'/api/device/sync',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify({deviceId:'test-device',player:'Example',status:{found:3,inRange:2,message:'Ready',hookAvailable:true}})});
+    assert.ok(script.includes('local KEY = '+JSON.stringify(key)));
+    const synced=await fetch(base+'/api/device/sync',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+key},body:JSON.stringify({deviceId:'test-device',player:'Example',status:{found:3,inRange:2,message:'Ready',hookAvailable:true}})});
     assert.equal(synced.status,200);assert.equal((await synced.json()).config.angle,180);
     const state=await(await fetch(base+'/api/state',{headers:{Cookie:cookie}})).json();assert.equal(state.devices[0].status.inRange,2);
     await fetch(base+'/api/logout',{method:'POST',headers,body:'{}'});
